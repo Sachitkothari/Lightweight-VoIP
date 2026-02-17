@@ -14,16 +14,44 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+#include <fstream>
+#include <string>
+
+std::string CFG_SERVER_IP = "127.0.0.1";
+int CFG_SERVER_PORT = 8080;
+
+void loadConfig() {
+    std::ifstream f("config.txt");
+    if (!f.is_open()) {
+        std::cerr << "config.txt not found. Using defaults.\n";
+        return;
+    }
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("SERVER_IP=", 0) == 0) {
+            CFG_SERVER_IP = line.substr(strlen("SERVER_IP="));
+        }
+        else if (line.rfind("SERVER_PORT=", 0) == 0) {
+            CFG_SERVER_PORT = std::stoi(line.substr(strlen("SERVER_PORT=")));
+        }
+    }
+}
+
+
+
 
 // ---- Config ----
+
 static const int SAMPLE_RATE     = 48000;
 static const int CHANNELS        = 1;
 static const int FRAME_MS        = 40;
 static const int FRAME_SAMPLES   = SAMPLE_RATE * FRAME_MS / 1000; // 1920
 static const int MAX_OPUS_PACKET = 4000;
 
-static const char* SERVER_IP   = "172.31.216.93";
-static const int   SERVER_PORT = 8080;
+// Values loaded from config.txt
+extern std::string CFG_SERVER_IP;
+extern int CFG_SERVER_PORT;
 
 // ---- Globals ----
 static OpusEncoder* g_encoder = nullptr;
@@ -212,6 +240,8 @@ static int audioCallback(
 }
 
 int main() {
+    loadConfig();
+    std::cout<<"CLIENT CONNECTING TO " << CFG_SERVER_IP << ":" << CFG_SERVER_PORT << "\n";
     // ---- Winsock init ----
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
@@ -228,8 +258,12 @@ int main() {
 
     memset(&g_serverAddr, 0, sizeof(g_serverAddr));
     g_serverAddr.sin_family = AF_INET;
-    g_serverAddr.sin_port   = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &g_serverAddr.sin_addr);
+    g_serverAddr.sin_port = htons(CFG_SERVER_PORT);
+    if (InetPtonA(AF_INET, CFG_SERVER_IP.c_str(), &g_serverAddr.sin_addr) != 1) {
+    std::cerr << "Invalid SERVER_IP in config.txt: " << CFG_SERVER_IP << "\n";
+    return 1;
+    }
+
 
     // ---- Opus init ----
     int opusErr = 0;
