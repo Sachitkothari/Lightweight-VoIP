@@ -81,7 +81,7 @@ void recvThreadFunc() {
         int n = recvfrom(g_sock, (char*)&p, sizeof(Packet), 0,
                          (sockaddr*)&from, &fromLen);
         if (n <= 0) continue;
-        std::cout << "Got packet from senderId=" << p.senderId << "\n";
+        //std::cout << "Got packet from senderId=" << p.senderId << "\n";
         // NEW: drop any packet that originated from this client
         if (p.senderId == g_senderId) {
             continue;
