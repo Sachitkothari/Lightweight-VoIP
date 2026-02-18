@@ -6,6 +6,9 @@
 #include <atomic>
 #include <cstring>
 #include <chrono>
+#include <fstream>
+#include <string>
+#include <random>
 
 #include "portaudio.h"
 #include "opus.h"
@@ -14,8 +17,6 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
-#include <fstream>
-#include <string>
 
 std::string CFG_SERVER_IP = "127.0.0.1";
 int CFG_SERVER_PORT = 8080;
@@ -38,9 +39,6 @@ void loadConfig() {
     }
 }
 
-
-
-
 // ---- Config ----
 
 static const int SAMPLE_RATE     = 48000;
@@ -49,10 +47,6 @@ static const int FRAME_MS        = 40;
 static const int FRAME_SAMPLES   = SAMPLE_RATE * FRAME_MS / 1000; // 1920
 static const int MAX_OPUS_PACKET = 4000;
 
-// Values loaded from config.txt
-extern std::string CFG_SERVER_IP;
-extern int CFG_SERVER_PORT;
-
 // ---- Globals ----
 static OpusEncoder* g_encoder = nullptr;
 static OpusDecoder* g_decoder = nullptr;
@@ -60,6 +54,7 @@ static OpusDecoder* g_decoder = nullptr;
 static SOCKET       g_sock = INVALID_SOCKET;
 static sockaddr_in  g_serverAddr{};
 static std::atomic<uint32_t> g_sequence{0};
+static uint32_t     g_senderId = 0;   // NEW: unique ID for this client
 
 static std::mutex g_queueMutex;
 static std::queue<std::vector<float>> g_playQueue;
@@ -86,6 +81,11 @@ void recvThreadFunc() {
         int n = recvfrom(g_sock, (char*)&p, sizeof(Packet), 0,
                          (sockaddr*)&from, &fromLen);
         if (n <= 0) continue;
+        std::cout << "Got packet from senderId=" << p.senderId << "\n";
+        // NEW: drop any packet that originated from this client
+        if (p.senderId == g_senderId) {
+            continue;
+        }
 
         float pcm[FRAME_SAMPLES];
 
@@ -170,14 +170,16 @@ static int audioCallback(
 
         if (bytes > 0) {
             Packet p{};
-            p.sequence     = g_sequence.fetch_add(1);
-            p.timestamp_ms = now_ms();
-            p.size         = (uint16_t)bytes;
+            p.senderId    = g_senderId;                 // NEW
+            p.sequence    = g_sequence.fetch_add(1);
+            p.timestamp_ms= now_ms();
+            p.size        = (uint16_t)bytes;
+            p.reserved    = 0;
             memcpy(p.data, opusData, bytes);
-
+            int packetSize = sizeof(Packet) - MAX_PAYLOAD + p.size;
             sendto(g_sock,
                    (const char*)&p,
-                   sizeof(Packet),
+                   packetSize,
                    0,
                    (sockaddr*)&g_serverAddr,
                    sizeof(g_serverAddr));
@@ -241,7 +243,17 @@ static int audioCallback(
 
 int main() {
     loadConfig();
-    std::cout<<"CLIENT CONNECTING TO " << CFG_SERVER_IP << ":" << CFG_SERVER_PORT << "\n";
+    std::cout << "CLIENT CONNECTING TO " << CFG_SERVER_IP << ":" << CFG_SERVER_PORT << "\n";
+
+    // ---- Generate unique senderId ----
+    {
+        std::random_device rd;
+        std::mt19937 rng(rd());
+        std::uniform_int_distribution<uint32_t> dist;
+        g_senderId = dist(rng);
+        std::cout << "Sender ID: " << g_senderId << "\n";
+    }
+
     // ---- Winsock init ----
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
@@ -260,10 +272,9 @@ int main() {
     g_serverAddr.sin_family = AF_INET;
     g_serverAddr.sin_port = htons(CFG_SERVER_PORT);
     if (InetPtonA(AF_INET, CFG_SERVER_IP.c_str(), &g_serverAddr.sin_addr) != 1) {
-    std::cerr << "Invalid SERVER_IP in config.txt: " << CFG_SERVER_IP << "\n";
-    return 1;
+        std::cerr << "Invalid SERVER_IP in config.txt: " << CFG_SERVER_IP << "\n";
+        return 1;
     }
-
 
     // ---- Opus init ----
     int opusErr = 0;

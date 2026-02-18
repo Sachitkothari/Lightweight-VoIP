@@ -5,10 +5,9 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 
-#include "../packet.h"
+#include "../packet.h"   // MUST match client version exactly
 
 #define PORT 8080
-#define MAXLINE 1024
 
 struct Client {
     sockaddr_in addr;
@@ -21,7 +20,7 @@ bool sameClient(const sockaddr_in& a, const sockaddr_in& b) {
 }
 
 int main() {
-    // Initialize Winsock
+    // ---- Winsock init ----
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
         std::cerr << "WSAStartup failed\n";
@@ -60,6 +59,7 @@ int main() {
         if (n <= 0)
             continue;
 
+        // ---- Register new client ----
         bool known = false;
         for (auto& c : clients) {
             if (sameClient(c.addr, cliaddr)) {
@@ -75,13 +75,15 @@ int main() {
 
             char ip[64];
             inet_ntop(AF_INET, &cliaddr.sin_addr, ip, sizeof(ip));
-            std::cout << "New client: " << ip << ":" << ntohs(cliaddr.sin_port) << "\n";
+            std::cout << "New client: " << ip << ":" << ntohs(cliaddr.sin_port)
+                      << " (senderId=" << p.senderId << ")\n";
         }
 
-        // Broadcast to all other clients
+        // ---- Broadcast to all OTHER clients ----
         for (auto& c : clients) {
             if (!sameClient(c.addr, cliaddr)) {
-                sendto(sockfd, (char*)&p, sizeof(Packet), 0,
+                int packetSize = sizeof(Packet) - MAX_PAYLOAD + p.size;
+                sendto(sockfd, (char*)&p, packetSize, 0,
                        (sockaddr*)&c.addr, sizeof(c.addr));
             }
         }
