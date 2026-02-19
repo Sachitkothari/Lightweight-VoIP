@@ -68,6 +68,37 @@ uint32_t now_ms() {
     ).count();
 }
 
+void applyCompression(float* samples, int count) {
+    // 1. Compute RMS loudness
+    float sum = 0.0f;
+    for (int i = 0; i < count; i++)
+        sum += samples[i] * samples[i];
+
+    float rms = sqrtf(sum / count);
+
+    // 2. Target RMS loudness (comfortable level)
+    const float target = 0.1f;
+
+    // 3. Compute gain factor
+    float gain = 1.0f;
+    if (rms > 0.0001f)
+        gain = target / rms;
+
+    // 4. Limit maximum gain (prevents over-amplifying noise)
+    if (gain > 5.0f)
+        gain = 5.0f;
+
+    // 5. Apply gain
+    for (int i = 0; i < count; i++)
+        samples[i] *= gain;
+
+    // 6. Hard limiter to prevent clipping
+    for (int i = 0; i < count; i++) {
+        if (samples[i] > 1.0f) samples[i] = 1.0f;
+        if (samples[i] < -1.0f) samples[i] = -1.0f;
+    }
+}
+
 // ---- UDP receive thread ----
 void recvThreadFunc() {
     uint32_t expectedSeq = 0;
@@ -130,7 +161,7 @@ void recvThreadFunc() {
             0
         );
         if (frameCount <= 0) continue;
-
+        applyCompression(pcm, frameCount);
         std::vector<float> frame(pcm, pcm + frameCount);
 
         {
