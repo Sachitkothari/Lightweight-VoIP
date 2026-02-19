@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
+#include <cmath>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -12,20 +13,18 @@
 #define PORT 8080
 #define SAMPLE_RATE 48000
 #define CHANNELS 1
-#define FRAME_MS 40
+#define FRAME_MS 20
 #define FRAME_SAMPLES (SAMPLE_RATE * FRAME_MS / 1000)
 #define MAX_OPUS_PACKET 4000
 
 struct Client {
-    sockaddr_in addr;
+    sockaddr_in addr{};
     OpusDecoder* decoder = nullptr;
     OpusEncoder* encoder = nullptr;
 
-    // Last decoded PCM frame (for mixing / PLC)
-    float pcm[FRAME_SAMPLES]{};
+    float pcm[FRAME_SAMPLES]{};   // last decoded frame
     bool hasPcm = false;
 
-    // Pending Opus packet from recv loop
     unsigned char pendingData[MAX_OPUS_PACKET]{};
     int pendingSize = 0;
     bool hasPending = false;
@@ -54,7 +53,7 @@ int main() {
         return 1;
     }
 
-    // Make socket non-blocking
+    // Non-blocking socket
     u_long mode = 1;
     ioctlsocket(sockfd, FIONBIO, &mode);
 
@@ -84,7 +83,7 @@ int main() {
             int n = recvfrom(sockfd, (char*)&p, sizeof(Packet), 0,
                              (sockaddr*)&cliaddr, &len);
             if (n <= 0)
-                break; // no more data right now
+                break;
 
             // Find or create client
             Client* sender = nullptr;
@@ -114,8 +113,12 @@ int main() {
                     continue;
                 }
 
-                opus_encoder_ctl(c.encoder, OPUS_SET_BITRATE(32000));
-                opus_encoder_ctl(c.encoder, OPUS_SET_COMPLEXITY(5));
+                // Opus tuning for clarity
+                opus_encoder_ctl(c.encoder, OPUS_SET_BITRATE(48000));          // 48 kbps
+                opus_encoder_ctl(c.encoder, OPUS_SET_VBR(1));
+                opus_encoder_ctl(c.encoder, OPUS_SET_COMPLEXITY(10));
+                opus_encoder_ctl(c.encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+                opus_encoder_ctl(c.encoder, OPUS_SET_DTX(0));
 
                 clients.push_back(c);
                 sender = &clients.back();
@@ -126,7 +129,6 @@ int main() {
                           << " (senderId=" << p.senderId << ")\n";
             }
 
-            // Store pending Opus packet for this client
             if (p.size > 0 && p.size <= MAX_OPUS_PACKET) {
                 memcpy(sender->pendingData, p.data, p.size);
                 sender->pendingSize = p.size;
@@ -135,7 +137,7 @@ int main() {
             }
         }
 
-        // ---- 40 ms mixing tick ----
+        // ---- 20 ms mixing tick ----
         DWORD now = GetTickCount();
         if (now - lastMixMs < FRAME_MS)
             continue;
@@ -144,9 +146,9 @@ int main() {
         if (clients.empty())
             continue;
 
-        // 1) Ensure each client has a PCM frame (decode or PLC)
+        // 1) Ensure each client has a PCM frame (decode or PLC/silence)
         for (auto& c : clients) {
-            if (c.decoder == nullptr)
+            if (!c.decoder)
                 continue;
 
             if (c.hasPending) {
@@ -159,35 +161,36 @@ int main() {
                     0
                 );
                 if (frameCount <= 0) {
-                    // decode failed, generate silence
                     std::memset(c.pcm, 0, sizeof(c.pcm));
                 }
                 c.hasPending = false;
                 c.hasPcm = true;
             } else if (c.hasPcm) {
-                // No new packet this tick: use PLC to extend
-                int frameCount = opus_decode_float(
-                    c.decoder,
-                    nullptr,
-                    0,
-                    c.pcm,
-                    FRAME_SAMPLES,
-                    0
-                );
-                if (frameCount <= 0) {
-                    // PLC failed, keep last or silence
-                    // here we just keep last c.pcm
+                // If recently active, use PLC; otherwise silence
+                if (now - c.lastActiveMs < 200) {
+                    int frameCount = opus_decode_float(
+                        c.decoder,
+                        nullptr,
+                        0,
+                        c.pcm,
+                        FRAME_SAMPLES,
+                        0
+                    );
+                    if (frameCount <= 0) {
+                        // keep last or silence; here we keep last
+                    }
+                } else {
+                    std::memset(c.pcm, 0, sizeof(c.pcm));
                 }
             } else {
-                // No history yet: silence
                 std::memset(c.pcm, 0, sizeof(c.pcm));
                 c.hasPcm = true;
             }
         }
 
-        // 2) For each destination client, mix all other clients and send
+        // 2) For each destination client, mix others and send
         for (auto& dst : clients) {
-            if (dst.encoder == nullptr)
+            if (!dst.encoder)
                 continue;
 
             float mix[FRAME_SAMPLES]{};
@@ -208,9 +211,10 @@ int main() {
             if (contributors == 0)
                 continue;
 
-            // Normalize
+            // Soft normalization: scale by 1/sqrt(N) instead of 1/N
+            float scale = 1.0f / std::sqrt((float)contributors);
             for (int i = 0; i < FRAME_SAMPLES; i++)
-                mix[i] /= contributors;
+                mix[i] *= scale;
 
             // Encode mixed frame
             unsigned char opusData[MAX_OPUS_PACKET];
@@ -224,9 +228,8 @@ int main() {
             if (bytes <= 0)
                 continue;
 
-            // Build packet (senderId here is "mixed", you can set 0 or any policy)
             Packet out{};
-            out.senderId = 0; // mixed stream, not a single speaker
+            out.senderId = 0; // mixed stream
             out.sequence = 0;
             out.timestamp_ms = now;
             out.size = bytes;
@@ -243,7 +246,6 @@ int main() {
         }
     }
 
-    // Cleanup (not really reached)
     for (auto& c : clients) {
         if (c.decoder) opus_decoder_destroy(c.decoder);
         if (c.encoder) opus_encoder_destroy(c.encoder);

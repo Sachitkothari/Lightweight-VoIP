@@ -43,8 +43,8 @@ void loadConfig() {
 
 static const int SAMPLE_RATE     = 48000;
 static const int CHANNELS        = 1;
-static const int FRAME_MS        = 40;
-static const int FRAME_SAMPLES   = SAMPLE_RATE * FRAME_MS / 1000; // 1920
+static const int FRAME_MS        = 20;
+static const int FRAME_SAMPLES   = SAMPLE_RATE * FRAME_MS / 1000; // 960
 static const int MAX_OPUS_PACKET = 4000;
 
 // ---- Globals ----
@@ -54,7 +54,7 @@ static OpusDecoder* g_decoder = nullptr;
 static SOCKET       g_sock = INVALID_SOCKET;
 static sockaddr_in  g_serverAddr{};
 static std::atomic<uint32_t> g_sequence{0};
-static uint32_t     g_senderId = 0;   // NEW: unique ID for this client
+static uint32_t     g_senderId = 0;
 
 static std::mutex g_queueMutex;
 static std::queue<std::vector<float>> g_playQueue;
@@ -70,29 +70,23 @@ uint32_t now_ms() {
 
 void applyAdaptiveCompression(float* samples, int count) {
     static float gain = 1.0f;
-    static float longTermRMS = 0.05f; // adaptive baseline
+    static float longTermRMS = 0.05f;
 
-    // 1. Compute RMS of this frame
     float sum = 0.0f;
     for (int i = 0; i < count; i++)
         sum += samples[i] * samples[i];
 
     float rms = sqrtf(sum / count);
 
-    // 2. Update long-term RMS (slow smoothing)
     longTermRMS = 0.995f * longTermRMS + 0.005f * rms;
 
-    // 3. Target RMS relative to long-term average
-    float target = longTermRMS * 1.5f; // adaptive target
+    float target = longTermRMS * 1.5f;
 
-    // 4. Compute raw gain
     float rawGain = (rms > 0.0001f) ? (target / rms) : 1.0f;
 
-    // 5. Clamp raw gain
     if (rawGain > 3.0f) rawGain = 3.0f;
     if (rawGain < 0.3f) rawGain = 0.3f;
 
-    // 6. Smooth gain (attack/release)
     float attack = 0.05f;
     float release = 0.005f;
 
@@ -101,11 +95,9 @@ void applyAdaptiveCompression(float* samples, int count) {
     else
         gain += release * (rawGain - gain);
 
-    // 7. Apply gain
     for (int i = 0; i < count; i++)
         samples[i] *= gain;
 
-    // 8. Soft limiter (prevents clipping)
     for (int i = 0; i < count; i++) {
         float x = samples[i];
         if (fabsf(x) > 0.9f) {
@@ -128,29 +120,24 @@ void recvThreadFunc() {
         int n = recvfrom(g_sock, (char*)&p, sizeof(Packet), 0,
                          (sockaddr*)&from, &fromLen);
         if (n <= 0) continue;
-        //std::cout << "Got packet from senderId=" << p.senderId << "\n";
-        // NEW: drop any packet that originated from this client
-        if (p.senderId == g_senderId) {
+
+        if (p.senderId == g_senderId)
             continue;
-        }
 
         float pcm[FRAME_SAMPLES];
 
-        // First packet: accept sequence number
         if (firstPacket) {
             expectedSeq = p.sequence + 1;
             firstPacket = false;
         }
 
-        // Detect packet loss
         if (p.sequence != expectedSeq) {
             int lost = (int)(p.sequence - expectedSeq);
             if (lost > 0 && lost < 50) {
-                // Generate PLC frames for each lost packet
                 for (int i = 0; i < lost; i++) {
                     opus_decode_float(
                         g_decoder,
-                        NULL, 0,          // PLC mode
+                        NULL, 0,
                         pcm,
                         FRAME_SAMPLES,
                         0
@@ -167,7 +154,6 @@ void recvThreadFunc() {
 
         expectedSeq = p.sequence + 1;
 
-        // Decode the received packet
         int frameCount = opus_decode_float(
             g_decoder,
             p.data,
@@ -177,6 +163,7 @@ void recvThreadFunc() {
             0
         );
         if (frameCount <= 0) continue;
+
         applyAdaptiveCompression(pcm, frameCount);
         std::vector<float> frame(pcm, pcm + frameCount);
 
@@ -184,8 +171,7 @@ void recvThreadFunc() {
             std::lock_guard<std::mutex> lock(g_queueMutex);
             g_playQueue.push(std::move(frame));
 
-            // Prevent lag buildup
-            while (g_playQueue.size() > 20)
+            while (g_playQueue.size() > 40)
                 g_playQueue.pop();
         }
     }
@@ -210,14 +196,14 @@ static int audioCallback(
         int bytes = opus_encode_float(
             g_encoder,
             in,
-            (int)framesPerBuffer,
+            FRAME_SAMPLES,
             opusData,
             MAX_OPUS_PACKET
         );
 
         if (bytes > 0) {
             Packet p{};
-            p.senderId    = g_senderId;                 // NEW
+            p.senderId    = g_senderId;
             p.sequence    = g_sequence.fetch_add(1);
             p.timestamp_ms= now_ms();
             p.size        = (uint16_t)bytes;
@@ -235,30 +221,26 @@ static int audioCallback(
 
     // 2) Adaptive jitter buffer playback
     static bool bufferPrimed = false;
-    static int targetBuffer = 5; // adaptive target
+    static int targetBuffer = 10;
 
     std::vector<float> frame;
 
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
 
-        // Adaptive jitter: grow if needed
         if (!bufferPrimed) {
             if (g_playQueue.size() >= targetBuffer)
                 bufferPrimed = true;
             else {
-                for (unsigned long i = 0; i < framesPerBuffer; i++)
-                    out[i] = 0.0f;
+                memset(out, 0, framesPerBuffer * sizeof(float));
                 return paContinue;
             }
         }
 
-        // If queue is too small, increase buffer target
-        if (g_playQueue.size() < 2 && targetBuffer < 10)
+        if (g_playQueue.size() < 4 && targetBuffer < 15)
             targetBuffer++;
 
-        // If queue is too large, shrink buffer target
-        if (g_playQueue.size() > 8 && targetBuffer > 3)
+        if (g_playQueue.size() > 12 && targetBuffer > 6)
             targetBuffer--;
 
         if (!g_playQueue.empty()) {
@@ -274,7 +256,6 @@ static int audioCallback(
         for (unsigned long i = toCopy; i < framesPerBuffer; ++i)
             out[i] = 0.0f;
     } else {
-        // PLC fallback
         float plc[FRAME_SAMPLES];
         opus_decode_float(g_decoder, NULL, 0, plc, FRAME_SAMPLES, 0);
 
@@ -292,7 +273,6 @@ int main() {
     loadConfig();
     std::cout << "CLIENT CONNECTING TO " << CFG_SERVER_IP << ":" << CFG_SERVER_PORT << "\n";
 
-    // ---- Generate unique senderId ----
     {
         std::random_device rd;
         std::mt19937 rng(rd());
@@ -301,7 +281,6 @@ int main() {
         std::cout << "Sender ID: " << g_senderId << "\n";
     }
 
-    // ---- Winsock init ----
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
         std::cerr << "WSAStartup failed\n";
@@ -323,7 +302,6 @@ int main() {
         return 1;
     }
 
-    // ---- Opus init ----
     int opusErr = 0;
     g_encoder = opus_encoder_create(
         SAMPLE_RATE,
@@ -336,7 +314,6 @@ int main() {
         return 1;
     }
 
-    // Opus tuning
     opus_encoder_ctl(g_encoder, OPUS_SET_BITRATE(64000));
     opus_encoder_ctl(g_encoder, OPUS_SET_COMPLEXITY(10));
     opus_encoder_ctl(g_encoder, OPUS_SET_INBAND_FEC(1));
@@ -353,7 +330,6 @@ int main() {
         return 1;
     }
 
-    // ---- PortAudio init ----
     PaError err = Pa_Initialize();
     if (err != paNoError) {
         std::cerr << "Pa_Initialize failed: " << Pa_GetErrorText(err) << "\n";
@@ -364,11 +340,11 @@ int main() {
 
     err = Pa_OpenDefaultStream(
         &stream,
-        1,              // input channels
-        1,              // output channels
-        paFloat32,      // sample format
+        1,
+        1,
+        paFloat32,
         SAMPLE_RATE,
-        FRAME_SAMPLES,  // frames per buffer = 40ms
+        FRAME_SAMPLES,  // 20ms = 960 samples
         audioCallback,
         nullptr
     );
@@ -379,10 +355,8 @@ int main() {
         return 1;
     }
 
-    // ---- Start receiver thread ----
     std::thread recvThread(recvThreadFunc);
 
-    // ---- Start audio ----
     err = Pa_StartStream(stream);
     if (err != paNoError) {
         std::cerr << "Pa_StartStream failed: " << Pa_GetErrorText(err) << "\n";
@@ -396,7 +370,6 @@ int main() {
     std::cout << "VoIP client running. Press Enter to exit.\n";
     std::cin.get();
 
-    // ---- Shutdown ----
     g_running = false;
     closesocket(g_sock);
     recvThread.join();
