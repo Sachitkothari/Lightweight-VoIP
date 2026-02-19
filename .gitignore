@@ -1,3 +1,4 @@
 config.txt
 ucrtbased.dll
 vcruntime140d.dll
+.vscode/c_cpp_properties.json
