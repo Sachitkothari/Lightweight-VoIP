@@ -68,34 +68,50 @@ uint32_t now_ms() {
     ).count();
 }
 
-void applyCompression(float* samples, int count) {
-    // 1. Compute RMS loudness
+void applyAdaptiveCompression(float* samples, int count) {
+    static float gain = 1.0f;
+    static float longTermRMS = 0.05f; // adaptive baseline
+
+    // 1. Compute RMS of this frame
     float sum = 0.0f;
     for (int i = 0; i < count; i++)
         sum += samples[i] * samples[i];
 
     float rms = sqrtf(sum / count);
 
-    // 2. Target RMS loudness (comfortable level)
-    const float target = 0.1f;
+    // 2. Update long-term RMS (slow smoothing)
+    longTermRMS = 0.995f * longTermRMS + 0.005f * rms;
 
-    // 3. Compute gain factor
-    float gain = 1.0f;
-    if (rms > 0.0001f)
-        gain = target / rms;
+    // 3. Target RMS relative to long-term average
+    float target = longTermRMS * 1.5f; // adaptive target
 
-    // 4. Limit maximum gain (prevents over-amplifying noise)
-    if (gain > 5.0f)
-        gain = 5.0f;
+    // 4. Compute raw gain
+    float rawGain = (rms > 0.0001f) ? (target / rms) : 1.0f;
 
-    // 5. Apply gain
+    // 5. Clamp raw gain
+    if (rawGain > 3.0f) rawGain = 3.0f;
+    if (rawGain < 0.3f) rawGain = 0.3f;
+
+    // 6. Smooth gain (attack/release)
+    float attack = 0.05f;
+    float release = 0.005f;
+
+    if (rawGain > gain)
+        gain += attack * (rawGain - gain);
+    else
+        gain += release * (rawGain - gain);
+
+    // 7. Apply gain
     for (int i = 0; i < count; i++)
         samples[i] *= gain;
 
-    // 6. Hard limiter to prevent clipping
+    // 8. Soft limiter (prevents clipping)
     for (int i = 0; i < count; i++) {
-        if (samples[i] > 1.0f) samples[i] = 1.0f;
-        if (samples[i] < -1.0f) samples[i] = -1.0f;
+        float x = samples[i];
+        if (fabsf(x) > 0.9f) {
+            samples[i] = (x > 0 ? 0.9f : -0.9f) +
+                         0.1f * tanhf((fabsf(x) - 0.9f) * 10.0f);
+        }
     }
 }
 
@@ -161,7 +177,7 @@ void recvThreadFunc() {
             0
         );
         if (frameCount <= 0) continue;
-        applyCompression(pcm, frameCount);
+        applyAdaptiveCompression(pcm, frameCount);
         std::vector<float> frame(pcm, pcm + frameCount);
 
         {
